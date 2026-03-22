@@ -148,4 +148,9 @@ echo "  HERMES_HOME=${HERMES_HOME}"
 echo "  Workspace=${WORKSPACE}"
 echo ""
 
+# Always sync model from env var if set
+if [ -n "${HERMES_MODEL:-}" ]; then
+  sed -i "s|^model:.*|model: \"${HERMES_MODEL}\"|" "${HERMES_HOME}/config.yaml"
+fi
+
 exec hermes gateway
