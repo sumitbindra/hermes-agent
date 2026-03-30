@@ -23,12 +23,6 @@ Tool registration
 -----------------
 ``PluginContext.register_tool()`` delegates to ``tools.registry.register()``
 so plugin-defined tools appear alongside the built-in tools.
-
-Slash command registration
---------------------------
-``PluginContext.register_command()`` adds a slash command to the central
-``COMMAND_REGISTRY`` so it appears in /help, autocomplete, and gateway
-dispatch.  Handlers receive the argument string and return a response.
 """
 
 from __future__ import annotations
@@ -74,6 +68,17 @@ def _env_enabled(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _get_disabled_plugins() -> set:
+    """Read the disabled plugins list from config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        disabled = config.get("plugins", {}).get("disabled", [])
+        return set(disabled) if isinstance(disabled, list) else set()
+    except Exception:
+        return set()
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -101,7 +106,6 @@ class LoadedPlugin:
     module: Optional[types.ModuleType] = None
     tools_registered: List[str] = field(default_factory=list)
     hooks_registered: List[str] = field(default_factory=list)
-    commands_registered: List[str] = field(default_factory=list)
     enabled: bool = False
     error: Optional[str] = None
 
@@ -148,44 +152,33 @@ class PluginContext:
         self._manager._plugin_tool_names.add(name)
         logger.debug("Plugin %s registered tool: %s", self.manifest.name, name)
 
-    # -- command registration ------------------------------------------------
+    # -- message injection --------------------------------------------------
 
-    def register_command(
-        self,
-        name: str,
-        handler: Callable,
-        description: str = "",
-        aliases: tuple[str, ...] = (),
-        args_hint: str = "",
-        cli_only: bool = False,
-        gateway_only: bool = False,
-    ) -> None:
-        """Register a slash command in the central command registry.
+    def inject_message(self, content: str, role: str = "user") -> bool:
+        """Inject a message into the active conversation.
 
-        The *handler* is called with a single ``args`` string (everything
-        after the command name) and should return a string to display to the
-        user, or ``None`` for no output.  Async handlers are also supported
-        (they will be awaited in the gateway).
+        If the agent is idle (waiting for user input), this starts a new turn.
+        If the agent is running, this interrupts and injects the message.
 
-        The command automatically appears in ``/help``, tab-autocomplete,
-        Telegram bot menu, Slack subcommand mapping, and gateway dispatch.
+        This enables plugins (e.g. remote control viewers, messaging bridges)
+        to send messages into the conversation from external sources.
+
+        Returns True if the message was queued successfully.
         """
-        from hermes_cli.commands import CommandDef, register_plugin_command
+        cli = self._manager._cli_ref
+        if cli is None:
+            logger.warning("inject_message: no CLI reference (not available in gateway mode)")
+            return False
 
-        cmd_def = CommandDef(
-            name=name,
-            description=description or f"Plugin command: {name}",
-            category="Plugins",
-            aliases=aliases,
-            args_hint=args_hint,
-            cli_only=cli_only,
-            gateway_only=gateway_only,
-        )
-        register_plugin_command(cmd_def)
-        self._manager._plugin_commands[name] = handler
-        for alias in aliases:
-            self._manager._plugin_commands[alias] = handler
-        logger.debug("Plugin %s registered command: /%s", self.manifest.name, name)
+        msg = content if role == "user" else f"[{role}] {content}"
+
+        if getattr(cli, "_agent_running", False):
+            # Agent is mid-turn — interrupt with the message
+            cli._interrupt_queue.put(msg)
+        else:
+            # Agent is idle — queue as next input
+            cli._pending_input.put(msg)
+        return True
 
     # -- hook registration --------------------------------------------------
 
@@ -218,8 +211,8 @@ class PluginManager:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
-        self._plugin_commands: Dict[str, Callable] = {}
         self._discovered: bool = False
+        self._cli_ref = None  # Set by CLI after plugin discovery
 
     # -----------------------------------------------------------------------
     # Public
@@ -246,8 +239,15 @@ class PluginManager:
         # 3. Pip / entry-point plugins
         manifests.extend(self._scan_entry_points())
 
-        # Load each manifest
+        # Load each manifest (skip user-disabled plugins)
+        disabled = _get_disabled_plugins()
         for manifest in manifests:
+            if manifest.name in disabled:
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = "disabled via config"
+                self._plugins[manifest.name] = loaded
+                logger.debug("Skipping disabled plugin '%s'", manifest.name)
+                continue
             self._load_plugin(manifest)
 
         if manifests:
@@ -372,14 +372,6 @@ class PluginManager:
                         for h in p.hooks_registered
                     }
                 )
-                loaded.commands_registered = [
-                    c for c in self._plugin_commands
-                    if c not in {
-                        n
-                        for name, p in self._plugins.items()
-                        for n in p.commands_registered
-                    }
-                ]
                 loaded.enabled = True
 
         except Exception as exc:
@@ -440,16 +432,23 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> None:
+    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
         Each callback is wrapped in its own try/except so a misbehaving
         plugin cannot break the core agent loop.
+
+        Returns a list of non-``None`` return values from callbacks.
+        This allows hooks like ``pre_llm_call`` to contribute context
+        that the agent core can collect and inject.
         """
         callbacks = self._hooks.get(hook_name, [])
+        results: List[Any] = []
         for cb in callbacks:
             try:
-                cb(**kwargs)
+                ret = cb(**kwargs)
+                if ret is not None:
+                    results.append(ret)
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
@@ -457,6 +456,7 @@ class PluginManager:
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
+        return results
 
     # -----------------------------------------------------------------------
     # Introspection
@@ -475,7 +475,6 @@ class PluginManager:
                     "enabled": loaded.enabled,
                     "tools": len(loaded.tools_registered),
                     "hooks": len(loaded.hooks_registered),
-                    "commands": len(loaded.commands_registered),
                     "error": loaded.error,
                 }
             )
@@ -502,9 +501,12 @@ def discover_plugins() -> None:
     get_plugin_manager().discover_and_load()
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> None:
-    """Invoke a lifecycle hook on all loaded plugins."""
-    get_plugin_manager().invoke_hook(hook_name, **kwargs)
+def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke a lifecycle hook on all loaded plugins.
+
+    Returns a list of non-``None`` return values from plugin callbacks.
+    """
+    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
 def get_plugin_tool_names() -> Set[str]:
@@ -512,6 +514,46 @@ def get_plugin_tool_names() -> Set[str]:
     return get_plugin_manager()._plugin_tool_names
 
 
-def get_plugin_command_handler(name: str) -> Optional[Callable]:
-    """Return the handler for a plugin-registered slash command, or None."""
-    return get_plugin_manager()._plugin_commands.get(name)
+def get_plugin_toolsets() -> List[tuple]:
+    """Return plugin toolsets as ``(key, label, description)`` tuples.
+
+    Used by the ``hermes tools`` TUI so plugin-provided toolsets appear
+    alongside the built-in ones and can be toggled on/off per platform.
+    """
+    manager = get_plugin_manager()
+    if not manager._plugin_tool_names:
+        return []
+
+    try:
+        from tools.registry import registry
+    except Exception:
+        return []
+
+    # Group plugin tool names by their toolset
+    toolset_tools: Dict[str, List[str]] = {}
+    toolset_plugin: Dict[str, LoadedPlugin] = {}
+    for tool_name in manager._plugin_tool_names:
+        entry = registry._tools.get(tool_name)
+        if not entry:
+            continue
+        ts = entry.toolset
+        toolset_tools.setdefault(ts, []).append(entry.name)
+
+    # Map toolsets back to the plugin that registered them
+    for _name, loaded in manager._plugins.items():
+        for tool_name in loaded.tools_registered:
+            entry = registry._tools.get(tool_name)
+            if entry and entry.toolset in toolset_tools:
+                toolset_plugin.setdefault(entry.toolset, loaded)
+
+    result = []
+    for ts_key in sorted(toolset_tools):
+        plugin = toolset_plugin.get(ts_key)
+        label = f"🔌 {ts_key.replace('_', ' ').title()}"
+        if plugin and plugin.manifest.description:
+            desc = plugin.manifest.description
+        else:
+            desc = ", ".join(sorted(toolset_tools[ts_key]))
+        result.append((ts_key, label, desc))
+
+    return result

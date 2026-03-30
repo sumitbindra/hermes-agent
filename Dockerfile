@@ -47,6 +47,9 @@ RUN if [ -d "mini-swe-agent" ] && [ -f "mini-swe-agent/pyproject.toml" ]; then \
 # Browser tools + WhatsApp (optional, non-fatal)
 RUN npm install 2>/dev/null || true
 
+# Playwright (for browser tools)
+RUN npx playwright install --with-deps chromium 2>/dev/null || true
+
 # ---------- Runtime config ----------
 
 # Railway mounts a persistent volume here — memory, skills, config survive redeploys
